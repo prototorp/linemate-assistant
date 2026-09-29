@@ -1,0 +1,1 @@
+This plain .txt file ended up in the docs folder. The loader only supports .md files, so it is skipped.
