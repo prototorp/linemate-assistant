@@ -11,7 +11,7 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api.routers import crew, documents
+from app.api.routers import crew, documents, tickets
 from app.core.exceptions import InvalidReferenceError
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -52,4 +52,5 @@ def health_check() -> dict[str, str]:
 
 
 app.include_router(documents.router)
+app.include_router(tickets.router)
 app.include_router(crew.router)
