@@ -1,5 +1,5 @@
 """RAG layer tests. No Ollama, no Chroma: the LLM and retriever are replaced with fakes, so what is
-tested is our wiring: the LCEL chain, memory, citations and staleness flags."""
+tested is OUR wiring: the LCEL chain, memory, citations and staleness flags."""
 
 from datetime import date
 
@@ -7,7 +7,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable, RunnableLambda
 
 from app.rag import qa_chain
-from app.rag.ask_service import AskService, build_citations
+from app.rag.ask_service import AskService, build_citations, stale_note
 from app.rag.qa_chain import NO_ANSWER, ConversationMemory, build_retrieval_chain, record_turn
 from tests.fakes import FakeRetriever, make_chunk
 
@@ -77,6 +77,17 @@ def test_follow_up_is_rewritten_before_retrieval():
     assert result["standalone_question"] == "How often do we filter the fryers?"
 
 
+def test_bad_rewrite_falls_back_to_previous_question_plus_follow_up():
+    from langchain_core.messages import HumanMessage
+    # the model "answers" instead of rewriting, which is not a question
+    chain, llm, retriever = _chain([make_chunk()], ScriptedLLM(condensed="36F to 38F"))
+    history = [HumanMessage("What temperature should the walk-in be?"), AIMessage("36F to 38F [1].")]
+    result = chain.invoke({"question": "what if it goes above that?", "summary": "", "recent_turns": history})
+    expected = "What temperature should the walk-in be? what if it goes above that?"
+    assert result["standalone_question"] == expected
+    assert retriever.queries == [expected]
+
+
 def test_answer_prompt_receives_history_context_and_stale_flag():
     from langchain_core.messages import HumanMessage
     chain, llm, _ = _chain([make_chunk(last_reviewed_at="2026-02-10")])
@@ -86,7 +97,7 @@ def test_answer_prompt_receives_history_context_and_stale_flag():
     assert "Crew asked about fryers." in prompt      # summary reaches the model
     assert "Tell me about fryers" in prompt          # recent turns reach the model
     assert "[1] Fryer Oil Filtration and Change SOP" in prompt
-    assert "STALE" in prompt                         # computed in code, shown to the model
+    assert "STALE: not reviewed in" in prompt        # computed in code, written into the source header
 
 
 def test_nothing_retrieved_returns_fixed_reply_without_calling_the_llm():
@@ -94,6 +105,11 @@ def test_nothing_retrieved_returns_fixed_reply_without_calling_the_llm():
     result = chain.invoke({"question": "What is the wifi password?", "summary": "", "recent_turns": []})
     assert result["answer"] == NO_ANSWER
     assert llm.answer_calls == []                    # nothing to hallucinate from
+
+
+def test_answer_prompt_keeps_its_template_variables():
+    # guards against a stray { } in the prompt text breaking the template
+    assert {"context", "summary", "question"} <= set(qa_chain._ANSWER_PROMPT.input_variables)
 
 
 # ---- memory --------------------------------------------------------------------
@@ -133,7 +149,20 @@ def test_two_chunks_of_one_document_produce_one_citation():
     citations = build_citations(chunks, "It says so [2].", as_of=AS_OF)
     assert len(citations) == 1
     assert citations[0].cited_in_answer is True
+    assert citations[0].source_numbers == [1, 2]         # both [n] labels map to this one document
     assert citations[0].excerpt == "second part"          # shows the chunk the answer used
+
+
+def test_every_number_in_the_answer_maps_to_exactly_one_listed_document():
+    chunks = [make_chunk(document_id=2, chunk_index=0), make_chunk(document_id=2, chunk_index=1),
+              make_chunk(document_id=1, title="Steak Guide", last_reviewed_at="2026-09-02")]
+    citations = build_citations(chunks, "Target is 36F [1] and [2]. Steaks rest 5 minutes [3].", as_of=AS_OF)
+    assert [(c.document_id, c.source_numbers, c.cited_in_answer) for c in citations] == [
+        (2, [1, 2], True),
+        (1, [3], True),
+    ]
+    listed = [n for c in citations for n in c.source_numbers]
+    assert sorted(listed) == [1, 2, 3]                   # no number is missing or repeated
 
 
 def test_answer_that_cites_nothing_is_visible_in_the_citations():
@@ -144,6 +173,26 @@ def test_answer_that_cites_nothing_is_visible_in_the_citations():
 def test_long_excerpts_are_truncated():
     citations = build_citations([make_chunk(text="word " * 200)], "x [1]", as_of=AS_OF)
     assert len(citations[0].excerpt) <= 243 and citations[0].excerpt.endswith("...")
+
+
+# ---- stale note (added in code) ---------------------------------------------------
+def test_stale_note_only_for_cited_stale_sources():
+    chunks = [make_chunk(document_id=2, last_reviewed_at="2026-02-10"),
+              make_chunk(document_id=1, title="Steak Guide", last_reviewed_at="2026-09-02"),
+              make_chunk(document_id=3, title="Old Unused Doc", last_reviewed_at="2025-01-01")]
+    citations = build_citations(chunks, "Filter twice a day [1]. Steaks rest 5 minutes [2].", as_of=AS_OF)
+    note = stale_note(citations, as_of=AS_OF)
+    assert "Fryer Oil Filtration and Change SOP" in note and "230 days" in note
+    assert "Steak Guide" not in note          # cited but fresh
+    assert "Old Unused Doc" not in note       # stale but never cited
+
+
+def test_no_stale_note_when_nothing_stale_is_cited():
+    citations = build_citations([make_chunk(last_reviewed_at="2026-09-02")], "Fine [1].", as_of=AS_OF)
+    assert stale_note(citations, as_of=AS_OF) == ""
+    incident = build_citations([make_chunk(category="Incident Report", last_reviewed_at="2020-01-01")],
+                               "It happened [1].", as_of=AS_OF)
+    assert stale_note(incident, as_of=AS_OF) == ""
 
 
 # ---- AskService end to end (fake chain, real memory handling) -------------------------
@@ -182,3 +231,11 @@ def test_clear_conversation_forgets_history():
     service.ask_in_conversation("c1", "fresh start question")
     assert llm.condense_calls == []
     assert service.clear_conversation("nope") is False
+
+
+def test_service_appends_stale_note_but_memory_keeps_the_clean_answer():
+    service, _, _ = _service(chunks=[make_chunk(last_reviewed_at="2026-02-10")])  # stale SOP
+    result = service.ask_in_conversation("c1", "How often do we filter the fryers?")
+    assert result.answer.startswith("Twice a day [1].")
+    assert "Note:" in result.answer and "confirm with your sous chef" in result.answer
+    assert service._conversations["c1"].recent_messages[-1].content == "Twice a day [1]."

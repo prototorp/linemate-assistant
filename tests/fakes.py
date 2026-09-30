@@ -1,4 +1,4 @@
-"""Test doubles so no test needs Ollama, Chroma, or the network"""
+"""Test doubles so no test needs Ollama, Chroma, or the network."""
 
 from langchain_core.documents import Document as LCDocument
 
@@ -58,6 +58,7 @@ class FakeAskService:
                 document_id=2, title="Fryer Oil Filtration and Change SOP", category="SOP",
                 last_reviewed_at="2026-02-10", is_stale=True,
                 excerpt="Filter each fryer twice per day...", cited_in_answer=cited,
+                source_numbers=[1],
             )
         ]
 

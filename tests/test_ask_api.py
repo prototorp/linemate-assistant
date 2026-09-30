@@ -1,5 +1,5 @@
-"""/ask routes with a fake AskService: tests the HTTP contract.
-The chain itself is tested in test_rag.py."""
+"""/ask routes with a fake AskService: tests the HTTP contract (validation, shapes, status codes,
+error mapping). The chain itself is tested in test_rag.py."""
 
 import pytest
 
@@ -26,6 +26,7 @@ def test_ask_returns_answer_with_citations(client, auth):
     assert source["title"] == "Fryer Oil Filtration and Change SOP"
     assert source["document_id"] == 2
     assert source["cited_in_answer"] is True
+    assert source["source_numbers"] == [1]
     assert source["is_stale"] is True
     assert body["conversation_id"] is None
 

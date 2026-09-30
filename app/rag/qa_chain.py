@@ -1,4 +1,4 @@
-"""The formal LCEL retrieval chain and conversation memory
+"""The formal LCEL retrieval chain and conversation memory.
 
 retrieval_chain is ONE composed Runnable. Each RunnablePassthrough.assign(...) adds a key to the
 running dict, so every later step can see what the earlier steps produced:
@@ -8,6 +8,10 @@ running dict, so every later step can see what the earlier steps produced:
       -> documents             (retriever over the persisted Chroma store)
       -> context               (numbered, citation-ready source blocks)
       -> answer                (grounded LLM answer, or a fixed "not found" reply if nothing retrieved)
+
+Memory is caller-owned (ConversationMemory): the last few turns are kept verbatim and older
+turns are folded into a short running summary, so a follow-up like "and how often do we do
+that?" works without repeating context.
 """
 
 from dataclasses import dataclass, field
@@ -39,12 +43,22 @@ _ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         "You are LineMate, the internal kitchen operations assistant for Hearthline restaurants. "
-        "Answer the crew member's question using ONLY the numbered sources below. Do not use "
-        "outside knowledge and do not invent details that are not in the sources. "
-        "Cite the sources you used inline as [1], [2], and so on. "
-        "If a source is marked STALE, tell the crew member the guidance may be out of date. "
-        "If the sources do not contain the answer, say so plainly instead of guessing. "
-        "Be short and practical: the crew is busy.\n\n"
+        "Answer the crew member's question using ONLY the numbered sources at the bottom. "
+        "Follow these rules exactly:\n"
+        "1. Every sentence that states a fact must end with the number of the source it came from "
+        "in square brackets, like [1], or [1][2] if two sources support it. "
+        "Never write a number that is not in the sources list. Never leave a fact uncited.\n"
+        "2. Use only what the sources say. Do not add outside knowledge, and do not guess. "
+        "If the sources do not contain the answer, reply only: "
+        "I couldn't find that in the documents.\n"
+        "3. Be short and practical: at most 4 sentences. The crew is busy. "
+        "Do not mention review dates or whether a source is out of date: that is added separately.\n\n"
+        "Example of the required style (the content here is made up):\n"
+        "Sources:\n"
+        "[1] Bread Cooling Guide (SOP, last reviewed 2026-09-01)\n"
+        "Cool loaves on the wire rack for 30 minutes before slicing.\n"
+        "Question: How long do loaves cool before slicing?\n"
+        "Answer: Let loaves cool on the wire rack for 30 minutes before slicing [1].\n\n"
         "Sources:\n{context}\n\n"
         "Summary of the conversation so far (empty if this is the first question): {summary}",
     ),
@@ -56,9 +70,15 @@ _CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         "You rewrite follow-up questions. Using the conversation below, rewrite the user's latest "
-        "question as one complete standalone question that makes sense without the conversation "
-        "(replace pronouns like 'it' or 'that' with what they refer to). If the question is "
-        "already standalone, repeat it unchanged. Output ONLY the question, nothing else.\n\n"
+        "question as one complete standalone QUESTION that makes sense without the conversation "
+        "(replace pronouns like 'it' or 'that' with what they refer to, and keep any numbers and "
+        "units from the conversation). Never answer the question. Your output must be a single "
+        "sentence ending in a question mark. If the question is already standalone, repeat it "
+        "unchanged. Output ONLY the question, nothing else.\n\n"
+        "Example (made up):\n"
+        "Earlier: Human: How long do loaves cool? AI: 30 minutes [1].\n"
+        "Latest question: and then how long do I wait to slice?\n"
+        "Output: After loaves have cooled for 30 minutes, how long do I wait before slicing them?\n\n"
         "Summary of earlier conversation (may be empty): {summary}",
     ),
     MessagesPlaceholder("recent_turns"),
@@ -78,6 +98,19 @@ _SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+def _pick_standalone(x: dict) -> str:
+    """Accept the model's rewrite only if it looks like a question. A small model sometimes
+    answers instead of rewriting (e.g. returns "36F to 38F"). In that case fall back to the
+    previous user question plus the follow-up, which still carries the topic into retrieval."""
+    rewritten = x["rewritten"]
+    if 10 <= len(rewritten) <= 300 and rewritten.endswith("?"):
+        return rewritten
+    last_user_question = next(
+        (m.content for m in reversed(x.get("recent_turns", [])) if isinstance(m, HumanMessage)), ""
+    )
+    return f"{last_user_question} {x['question']}".strip()
+
+
 def build_retrieval_chain(
     llm=None, retriever_factory: Callable[..., object] | None = None
 ) -> Runnable:
@@ -85,9 +118,13 @@ def build_retrieval_chain(
     llm = llm or get_llm()
     retriever_factory = retriever_factory or get_similarity_retriever
 
-    condense_chain = (
+    rewrite = (
         _CONDENSE_PROMPT | llm | StrOutputParser()
         | RunnableLambda(lambda text: text.strip().strip('"'))
+    )
+    # rewrite, then validate; the fallback needs the question and history, so keep the input dict
+    condense_chain = (
+        RunnablePassthrough.assign(rewritten=rewrite) | RunnableLambda(_pick_standalone)
     )
     answer_chain = _ANSWER_PROMPT | llm | StrOutputParser()
 

@@ -1,5 +1,6 @@
-"""AskService: what the /ask routes call
-Wraps the chain, memory, citations and reindexing
+"""AskService: what the /ask routes call. Wraps the chain, memory, citations and reindexing.
+
+The routes depend on this class (via Depends), so tests can swap in a fake and never need Ollama.
 """
 
 import re
@@ -34,7 +35,8 @@ class SourceCitation:
     last_reviewed_at: str
     is_stale: bool
     excerpt: str
-    cited_in_answer: bool  # True if the answer text actually references this source as [n]
+    cited_in_answer: bool  # True if the answer text references any of this document's [n] labels
+    source_numbers: list[int]  # every [n] label that belongs to this document's retrieved chunks
 
 
 @dataclass
@@ -53,7 +55,11 @@ def build_citations(
     documents: list[LCDocument], answer: str, as_of: date | None = None
 ) -> list[SourceCitation]:
     """Citations come from the retrieval metadata, not from trusting the model to name documents.
-    One entry per source document; `cited_in_answer` says whether the answer used it."""
+
+    The model cites CHUNKS ("[1]", "[2]"), but one document can supply several chunks. So there is
+    one entry per source document, and `source_numbers` lists every [n] label that belongs to it.
+    That way each number in the answer text maps to exactly one listed document, and
+    `cited_in_answer` says whether the answer used any of them."""
     as_of = as_of or date.today()
     cited_numbers = {int(n) for n in _CITATION_RE.findall(answer)}
     by_document: OrderedDict[int, SourceCitation] = OrderedDict()
@@ -72,11 +78,31 @@ def build_citations(
                 is_stale=is_chunk_stale(chunk, as_of),
                 excerpt=_excerpt(chunk.page_content),
                 cited_in_answer=is_cited,
+                source_numbers=[number],
             )
-        elif is_cited and not existing.cited_in_answer:
-            existing.cited_in_answer = True
-            existing.excerpt = _excerpt(chunk.page_content)  # show the chunk the answer used
+        else:
+            existing.source_numbers.append(number)
+            if is_cited and not existing.cited_in_answer:
+                existing.cited_in_answer = True
+                existing.excerpt = _excerpt(chunk.page_content)  # show the chunk the answer used
     return list(by_document.values())
+
+
+def stale_note(sources: list[SourceCitation], as_of: date | None = None) -> str:
+    """A warning for every source the answer actually cited that is overdue for review.
+
+    Written in code, not by the model: a 3B model ignored the instruction to add it. Sources that
+    were retrieved but not cited get no note (the answer did not rely on them)."""
+    as_of = as_of or date.today()
+    sentences = []
+    for source in sources:
+        if source.cited_in_answer and source.is_stale:
+            days = (as_of - date.fromisoformat(source.last_reviewed_at)).days
+            sentences.append(
+                f'Note: "{source.title}" was last reviewed {days} days ago and may be out of '
+                "date, so confirm with your sous chef."
+            )
+    return " ".join(sentences)
 
 
 class AskService:
@@ -126,9 +152,11 @@ class AskService:
                 "Could not reach the local LLM. Is Ollama running, with llama3.2 and "
                 "nomic-embed-text pulled?"
             ) from exc
+        sources = build_citations(result["documents"], result["answer"])
+        note = stale_note(sources)
         return AskResult(
-            answer=result["answer"],
-            sources=build_citations(result["documents"], result["answer"]),
+            answer=f"{result['answer']}\n\n{note}" if note else result["answer"],
+            sources=sources,
             standalone_question=result["standalone_question"],
         )
 
