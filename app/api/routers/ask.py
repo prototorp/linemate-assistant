@@ -2,11 +2,11 @@
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app.api.deps import get_ask_service, get_knowledge_base_service, get_today
 from app.api.schemas import (
-    AskRequest, AskResponse, ReindexResponse, RetrievedChunkOut, SourceOut,
+    AskRequest, AskResponse, ConversationAskRequest, ReindexResponse, RetrievedChunkOut, SourceOut,
 )
 from app.api.security import require_api_key
 from app.models import DocumentCategory
@@ -29,6 +29,24 @@ def _to_response(result: AskResult, conversation_id: str | None = None) -> AskRe
 @router.post("", response_model=AskResponse, summary="Ask a kitchen operations question")
 def ask(request: AskRequest, service: AskService = Depends(get_ask_service)):
     return _to_response(service.ask(request.question, k=request.k))
+
+
+@router.post(
+    "/conversation", response_model=AskResponse,
+    summary="Ask with conversation memory (follow-ups build on earlier turns)",
+)
+def ask_in_conversation(
+    request: ConversationAskRequest, service: AskService = Depends(get_ask_service)
+):
+    result = service.ask_in_conversation(request.conversation_id, request.question, k=request.k)
+    return _to_response(result, request.conversation_id)
+
+
+@router.delete("/conversation/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def forget_conversation(conversation_id: str, service: AskService = Depends(get_ask_service)):
+    if not service.clear_conversation(conversation_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No conversation {conversation_id!r}")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/retrieve", response_model=list[RetrievedChunkOut], summary="Retriever only, no LLM")

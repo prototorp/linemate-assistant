@@ -1,10 +1,12 @@
-"""/ask routes with a fake AskService: tests the HTTP contract (validation, shapes, status codes,
-error mapping). The chain itself is tested in test_rag.py."""
+"""/ask routes with a fake AskService: tests the HTTP contract.
+The chain itself is tested in test_rag.py."""
 
 import pytest
 
 ROUTES = [
     ("post", "/ask", {"question": "How often do we filter the fryers?"}),
+    ("post", "/ask/conversation", {"conversation_id": "c1", "question": "How often?"}),
+    ("delete", "/ask/conversation/c1", None),
     ("get", "/ask/retrieve?query=fryer", None),
     ("post", "/ask/reindex", None),
 ]
@@ -42,6 +44,26 @@ def test_ask_passes_k_through(client, auth, fake_ask):
 ])
 def test_ask_validates_the_request_body(client, auth, payload):
     assert client.post("/ask", json=payload, headers=auth).status_code == 422
+
+
+def test_conversation_echoes_id_and_rewrites_follow_ups(client, auth):
+    first = client.post("/ask/conversation", json={"conversation_id": "c1", "question": "How often do we filter fryers?"}, headers=auth).json()
+    second = client.post("/ask/conversation", json={"conversation_id": "c1", "question": "And who owns that SOP?"}, headers=auth).json()
+    assert first["conversation_id"] == second["conversation_id"] == "c1"
+    assert first["standalone_question"] == "How often do we filter fryers?"
+    assert second["standalone_question"].startswith("[rewritten with history]")
+
+
+def test_conversations_are_independent(client, auth):
+    client.post("/ask/conversation", json={"conversation_id": "a", "question": "first question"}, headers=auth)
+    other = client.post("/ask/conversation", json={"conversation_id": "b", "question": "first question"}, headers=auth).json()
+    assert other["standalone_question"] == "first question"  # b has no history
+
+
+def test_forget_conversation(client, auth):
+    client.post("/ask/conversation", json={"conversation_id": "c1", "question": "first question"}, headers=auth)
+    assert client.delete("/ask/conversation/c1", headers=auth).status_code == 204
+    assert client.delete("/ask/conversation/c1", headers=auth).status_code == 404
 
 
 def test_retrieve_returns_chunks_with_staleness(client, auth):
