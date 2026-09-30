@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.routers import analytics, ask, crew, documents, tickets
-from app.core.exceptions import InvalidReferenceError
+from app.core.exceptions import AnswerBackendError, InvalidReferenceError
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 access_log = logging.getLogger("linemate.access")
@@ -44,6 +44,11 @@ async def log_requests(request: Request, call_next):
 @app.exception_handler(InvalidReferenceError)
 async def invalid_reference_handler(request: Request, exc: InvalidReferenceError):
     return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(AnswerBackendError)
+async def answer_backend_handler(request: Request, exc: AnswerBackendError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.get("/", tags=["health"])
